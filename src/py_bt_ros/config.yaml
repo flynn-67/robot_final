@@ -1,0 +1,15 @@
+scenario: scenarios.nav2_homework
+
+agent:
+  # Nav2가 /TurtleBot3Burger/navigate_to_pose 라면 이렇게
+  # 만약 /navigate_to_pose 라면 "" 로 바꿔야 함 (아래 참고)
+  namespaces: ""
+  behavior_tree_xml: "default_bt.xml"
+
+bt_runner:
+  bt_tick_rate: 10.0 
+  bt_visualiser:
+    enabled: True
+    screen_width: 600 
+    screen_height: 600 
+  profiling_mode: False
