@@ -2,35 +2,44 @@
   <BehaviorTree ID="MainTree">
     <Sequence name="SmartHospitalSystem">
       
+      <!-- 1. 시작 신호 대기 -->
       <WaitForStart name="WaitPatientStart"/>
 
+      <!-- 2. 병원 순회 (최적 병원 선택 -> 이동 -> 진료 대기) -->
+      <!-- Visit 1 -->
       <Sequence name="Visit_1">
         <SelectBestHospital name="Think_1"/>
         <NavigateToPoseNode name="Move_1"/>
         <WaitForButton name="Doctor_1"/>
       </Sequence>
 
+      <!-- Visit 2 -->
       <Sequence name="Visit_2">
         <SelectBestHospital name="Think_2"/>
         <NavigateToPoseNode name="Move_2"/>
         <WaitForButton name="Doctor_2"/>
       </Sequence>
 
+      <!-- Visit 3 -->
       <Sequence name="Visit_3">
         <SelectBestHospital name="Think_3"/>
         <NavigateToPoseNode name="Move_3"/>
         <WaitForButton name="Doctor_3"/>
       </Sequence>
 
+      <!-- Visit 4 -->
       <Sequence name="Visit_4">
         <SelectBestHospital name="Think_4"/>
         <NavigateToPoseNode name="Move_4"/>
         <WaitForButton name="Doctor_4"/>
       </Sequence>
 
+      <!-- 3. 모든 진료 종료 후 집으로 복귀 -->
       <Sequence name="ReturnHome">
-         <SetHomeTarget name="SetHome"/> <NavigateToPoseNode name="MoveHome"/> </Sequence>
-      
+         <SetHomeTarget name="SetHome"/> 
+         <NavigateToPoseNode name="MoveHome"/> 
       </Sequence>
+      
+    </Sequence>
   </BehaviorTree>
 </root>
