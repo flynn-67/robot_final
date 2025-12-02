@@ -1,14 +1,36 @@
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <Fallback name="SafetySelector">
+    <Sequence name="SmartHospitalSystem">
       
-      <Sequence name="DriveSequence">
-        <CheckWallSafe name="IsSafe"/>
-        <NavigateToPoseNode name="GoToGoal" goal_x="1.0" goal_y="0.0"/>
+      <WaitForStart name="WaitPatientStart"/>
+
+      <Sequence name="Visit_1">
+        <SelectBestHospital name="Think_1"/>
+        <NavigateToPoseNode name="Move_1"/>
+        <WaitForButton name="Doctor_1"/>
       </Sequence>
 
-      <WallAvoid name="EmergencyAvoid" duration="2.0"/>
+      <Sequence name="Visit_2">
+        <SelectBestHospital name="Think_2"/>
+        <NavigateToPoseNode name="Move_2"/>
+        <WaitForButton name="Doctor_2"/>
+      </Sequence>
 
-    </Fallback>
+      <Sequence name="Visit_3">
+        <SelectBestHospital name="Think_3"/>
+        <NavigateToPoseNode name="Move_3"/>
+        <WaitForButton name="Doctor_3"/>
+      </Sequence>
+
+      <Sequence name="Visit_4">
+        <SelectBestHospital name="Think_4"/>
+        <NavigateToPoseNode name="Move_4"/>
+        <WaitForButton name="Doctor_4"/>
+      </Sequence>
+
+      <Sequence name="ReturnHome">
+         <SetHomeTarget name="SetHome"/> <NavigateToPoseNode name="MoveHome"/> </Sequence>
+      
+      </Sequence>
   </BehaviorTree>
 </root>
