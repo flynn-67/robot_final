@@ -1,125 +1,140 @@
 #!/usr/bin/env python3
+import faulthandler
+faulthandler.enable()
+
+import os
+import sys
+import time
+import threading
+import queue
+import json
+import requests
+import tkinter as tk
+
+# [중요] GUI 충돌 방지
+os.environ["GDK_BACKEND"] = "x11"
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
-import json
-import tkinter as tk
-from tkinter import messagebox
-import threading
-import sys
-import os
+
+# ==========================================
+# [설정] API 키 및 의사용 폼 ID
+# ==========================================
+API_KEY = "e57cc1f435fe873f0fdf8ada20298ba1"
+DOCTOR_FORM_ID = "253293055163051"  # 의사용 문진표 ID (QR코드가 연결된 곳)
+
+# [중요] 의사 폼의 필드 ID (JotForm에서 확인 필요, 틀리면 데이터 안 뜸)
+# URL 예시: ...?input_3=환자ID
+FIELD_PATIENT_ID = "3"      # 환자 고유 번호 (input_3)
+FIELD_DIAGNOSIS = "4"       # 진료 소견 (input_4 라고 가정 - 텍스트상자)
+FIELD_DEPT = "5"            # 진료과 (input_5 라고 가정 - 드롭다운)
 
 class DoctorDashboard:
-    def __init__(self, root, ros_node):
+    def __init__(self, root, node):
         self.root = root
-        self.node = ros_node
-        self.root.title("의료진용 컨트롤 패널")
-        self.root.geometry("450x550")
-        self.root.configure(bg="#333") 
+        self.node = node
+        self.root.title("의료진 통합 대시보드")
+        self.root.geometry("400x600")
+        self.root.configure(bg="white")
 
-        self.current_hospital = None
+        self.running = True
+        self.last_submission_id = None
+        self.target_patient_id = None # 현재 진료 중인 환자 ID
+
+        # ROS Publishers
+        self.pub_record = self.node.create_publisher(String, '/medical_record', 10)
+        self.pub_finish = self.node.create_publisher(Bool, '/exam_finished', 10)
         
-        # UI 구성
-        tk.Label(root, text="👨‍⚕️ 진료실 대시보드", font=("Arial", 18, "bold"), bg="#333", fg="white").pack(pady=20)
+        # ROS Subscribers
+        self.create_ui()
+        
+        # 의사 폼 감시 스레드 시작
+        self.monitor_thread = threading.Thread(target=self.loop_check_doctor_form, daemon=True)
+        self.monitor_thread.start()
 
-        # 상태창
-        self.status_frame = tk.Frame(root, bg="#444", padx=20, pady=20)
-        self.status_frame.pack(fill="x", padx=20)
-        self.lbl_loc = tk.Label(self.status_frame, text="상태: 시스템 대기 중", font=("Arial", 14), bg="#444", fg="#aaa")
-        self.lbl_loc.pack()
+    def create_ui(self):
+        tk.Label(self.root, text="JotForm 데이터 대기 중...", font=("Helvetica", 16, "bold"), bg="white").pack(pady=20)
+        
+        self.lbl_status = tk.Label(self.root, text="수신된 환자 ID: -", font=("Helvetica", 14), fg="blue", bg="white")
+        self.lbl_status.pack(pady=10)
 
-        # 진료 입력창
-        tk.Label(root, text="진료 소견 작성", font=("Arial", 12), bg="#333", fg="white", anchor="w").pack(fill="x", padx=20, pady=(20, 5))
-        self.text_diagnosis = tk.Text(root, height=8, font=("Arial", 11))
-        self.text_diagnosis.pack(fill="x", padx=20)
-        self.text_diagnosis.config(state="disabled", bg="#eee")
+        self.txt_log = tk.Text(self.root, height=15, width=40, font=("Helvetica", 10))
+        self.txt_log.pack(padx=20, pady=20)
+        self.txt_log.insert(tk.END, "[모바일에서 작성된 진료 소견]\n핸드폰으로 QR을 스캔하여 소견서를 제출하면\n여기에 자동으로 내용이 뜹니다.\n\n")
 
-        # 완료 버튼
-        self.btn_confirm = tk.Button(root, text="진료 완료 및 내보내기", font=("Arial", 14, "bold"), 
-                                     bg="#555", fg="white", state="disabled", command=self.complete_treatment)
-        self.btn_confirm.pack(fill="x", padx=20, pady=20)
+    def loop_check_doctor_form(self):
+        """ 주기적으로 의사 폼(JotForm)을 확인하여 새 제출이 있는지 감시 """
+        print(">>> [Dashboard] 의사 소견서 감시 시작...")
+        
+        while self.running:
+            try:
+                # 1. JotForm API로 최신 제출물 1개 가져오기
+                url = f"https://api.jotform.com/form/{DOCTOR_FORM_ID}/submissions?apiKey={API_KEY}&limit=1&orderby=created_at"
+                response = requests.get(url, timeout=5)
 
-        self.lbl_emergency = tk.Label(root, text="", font=("Arial", 14, "bold"), bg="#333", fg="red")
-        self.lbl_emergency.pack(pady=10)
+                if response.status_code == 200:
+                    data = response.json().get("content", [])
+                    if data:
+                        submission = data[0]
+                        sub_id = submission.get("id")
+                        
+                        # 새로운 제출이 발견되면 처리
+                        if sub_id != self.last_submission_id:
+                            self.last_submission_id = sub_id
+                            self.process_submission(submission)
+                
+            except Exception as e:
+                print(f"[API Error] {e}")
+            
+            time.sleep(3) # 3초마다 확인
 
-        # ROS 통신
-        self.sub_start = self.node.create_subscription(String, '/hospital_data', self.start_cb, 10)
-        self.sub_loc = self.node.create_subscription(String, '/current_hospital', self.location_cb, 10)
-        self.sub_emg = self.node.create_subscription(Bool, '/emergency', self.emergency_cb, 10)
-        self.pub_confirm = self.node.create_publisher(Bool, '/doctor_confirm', 10) 
-        self.pub_record = self.node.create_publisher(String, '/medical_record', 10) 
+    def process_submission(self, sub):
+        """ 의사가 제출한 데이터를 분석해서 ROS로 전송 """
+        answers = sub.get("answers", {})
+        
+        # 1. 데이터 추출 (ID값은 폼 설정에 따라 다를 수 있음)
+        p_id = answers.get(FIELD_PATIENT_ID, {}).get("answer", "Unknown")
+        diagnosis = answers.get(FIELD_DIAGNOSIS, {}).get("answer", "소견 없음")
+        dept = answers.get(FIELD_DEPT, {}).get("answer", "일반의")
 
-        # 처음 실행 시 창을 숨김
-        self.root.withdraw()
-        print(">>> [Doctor UI] 실행됨 (대기 상태 - 창 숨김)")
+        # UI 업데이트 (메인 스레드에서 실행되도록 after 사용 권장이나 간단히 처리)
+        log_msg = f"------------------------\n[수신] 환자 ID: {p_id}\n과목: {dept}\n소견: {diagnosis}\n"
+        self.txt_log.insert(tk.END, log_msg)
+        self.txt_log.see(tk.END)
+        self.lbl_status.config(text=f"수신된 환자 ID: {p_id}")
 
-    # --- ROS 콜백 (스레드 안전 처리) ---
-    def start_cb(self, msg):
-        # 메인 스레드에서 UI 업데이트를 수행하도록 예약
-        self.root.after(0, self._handle_start, msg)
-
-    def _handle_start(self, msg):
-        try:
-            data = json.loads(msg.data)
-            if data.get('command') == 'start':
-                self.root.deiconify() # 창 띄우기 (메인 스레드에서 실행됨)
-                self.lbl_loc.config(text="상태: 로봇 이동 중...", fg="#4f46e5")
-                print(">>> [Doctor UI] 화면 표시됨")
-        except: pass
-
-    def location_cb(self, msg):
-        self.root.after(0, self._handle_location, msg)
-
-    def _handle_location(self, msg):
-        self.current_hospital = msg.data.strip()
-        self.root.deiconify() # 안전장치
-        self.lbl_loc.config(text=f"환자 도착: {self.current_hospital}", fg="#10b981", font=("Arial", 16, "bold"))
-        self.text_diagnosis.config(state="normal", bg="white")
-        self.text_diagnosis.delete("1.0", tk.END)
-        self.btn_confirm.config(state="normal", bg="#4f46e5")
-        print(f">>> [Doctor] 환자 도착: {self.current_hospital}")
-
-    def emergency_cb(self, msg):
-        if msg.data:
-            self.root.after(0, self._handle_emergency)
-
-    def _handle_emergency(self):
-        self.root.deiconify()
-        self.lbl_emergency.config(text="🚨 긴급 호출 발생! 🚨")
-        messagebox.showwarning("긴급", "환자 긴급 호출 발생!")
-
-    def complete_treatment(self):
-        diagnosis_text = self.text_diagnosis.get("1.0", tk.END).strip()
-        if not diagnosis_text:
-            messagebox.showwarning("경고", "진료 소견을 입력해주세요.")
-            return
-
-        # 기록 전송
-        record_data = {"dept": self.current_hospital, "diagnosis": diagnosis_text}
+        # 2. 로봇/환자 UI로 데이터 전송 (ROS2)
+        # JSON 형태로 묶어서 보냄
+        record_data = {
+            "id": p_id,
+            "dept": dept,
+            "diagnosis": diagnosis,
+            "timestamp": time.time()
+        }
+        
+        # (A) 환자용 키오스크 화면 업데이트용
         self.pub_record.publish(String(data=json.dumps(record_data)))
+        print(f">>> [ROS 전송] /medical_record: {p_id} 진료 완료")
 
-        # 로봇 출발 신호
-        self.pub_confirm.publish(Bool(data=True))
+        # (B) 로봇에게 다음 동작 지시 (예: 진료 끝났으니 복귀해라)
+        self.pub_finish.publish(Bool(data=True))
+        print(f">>> [ROS 전송] /exam_finished: True")
 
-        # UI 리셋
-        self.lbl_loc.config(text=f"{self.current_hospital} 완료. 이동 중...", fg="#aaa", font=("Arial", 14))
-        self.text_diagnosis.delete("1.0", tk.END)
-        self.text_diagnosis.config(state="disabled", bg="#eee")
-        self.btn_confirm.config(state="disabled", bg="#555")
-        self.lbl_emergency.config(text="")
-        print(f">>> [Doctor] 진료 완료 처리됨 ({self.current_hospital})")
-
-def ros_thread(node):
+# ==========================================
+# ROS 스레드 및 메인 실행
+# ==========================================
+def ros_spin(node):
     rclpy.spin(node)
 
 def main():
     rclpy.init()
-    node = Node('doctor_ui_node')
+    node = Node('doctor_dashboard_node')
+    
     root = tk.Tk()
     app = DoctorDashboard(root, node)
     
-    t = threading.Thread(target=ros_thread, args=(node,))
-    t.daemon = True
+    t = threading.Thread(target=ros_spin, args=(node,), daemon=True)
     t.start()
     
     try:
@@ -127,8 +142,14 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        app.running = False
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
+        try:
+            root.destroy()
+        except:
+            pass
 
 if __name__ == '__main__':
     main()
