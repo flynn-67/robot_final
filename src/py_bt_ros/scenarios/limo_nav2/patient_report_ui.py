@@ -1,17 +1,38 @@
 #!/usr/bin/env python3
+import faulthandler
+faulthandler.enable()  # 세그폴트 발생 시 원인 추적
+
+import os
+import sys
+import time
+import threading
+import queue
+import json
+import random
+import requests
+from io import BytesIO
+
+# [중요] tkinter를 rclpy보다 먼저 import 해야 충돌이 적습니다.
+import tkinter as tk
+from tkinter import messagebox
+from PIL import Image, ImageTk
+import qrcode
+
+# ROS 관련 import
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String, Bool
-import json
-import tkinter as tk
-from tkinter import messagebox
-import threading
-from datetime import datetime
-import random
-import sys
-import os
 
-# 병원 진료 과목 정의
+# ==========================================
+# [설정] API 키 및 폼 ID
+# ==========================================
+API_KEY = "e57cc1f435fe873f0fdf8ada20298ba1"
+FORM_ID = "253292147686062"       # 환자용 문진표
+DOCTOR_FORM_ID = "253293055163051" # 의사용 문진표
+FIELD_ID_NAME = "3"
+FIELD_ID_UNIQUE_NUM = "12"
+TARGET_FIELD_NAME = "input_3"
+
 DEPARTMENTS = [
     {"name": "내과", "desc": "혈압 및 기본 검사"},
     {"name": "외과", "desc": "신체 외상 검사"},
@@ -24,169 +45,218 @@ class SmartHospitalApp:
         self.root = root
         self.node = ros_node
         self.root.title("스마트 병원 환자용 키오스크")
-        self.root.geometry("500x750")
+        self.root.geometry("500x850")
         self.root.configure(bg="#f0f4f8")
 
-        # 데이터 초기화
         self.patient_name = ""
+        self.unique_id = None
+        self.report_link = ""
+        self.qr_image = None
         self.medical_records = []
         self.waiting_counts = {}
         self.dept_labels = {}
+        self.last_submission_id = None
+        self.running = True  # 앱 실행 상태 플래그
 
-        # 메인 프레임
+        self.event_queue = queue.Queue()
+
         self.main_frame = tk.Frame(root, bg="#f0f4f8")
         self.main_frame.pack(fill="both", expand=True, padx=20, pady=20)
         
-        # 초기 화면 로드
         self.show_home_screen()
 
-        # ROS 통신 설정
+        # ROS Publishers
         self.pub_start = self.node.create_publisher(String, '/hospital_data', 10)
         self.pub_emergency = self.node.create_publisher(Bool, '/emergency', 10)
         
-        self.sub_loc = self.node.create_subscription(String, '/current_hospital', self.update_location_cb, 10)
-        self.sub_fin = self.node.create_subscription(Bool, '/exam_finished', self.finish_cb, 10)
-        self.sub_record = self.node.create_subscription(String, '/medical_record', self.receive_record_cb, 10)
+        # ROS Subscribers
+        self.sub_loc = self.node.create_subscription(String, '/current_hospital', 
+            lambda m: self.event_queue.put(("location", m.data)), 10)
+        self.sub_fin = self.node.create_subscription(Bool, '/exam_finished', 
+            lambda m: self.event_queue.put(("finish", m.data)), 10)
+        self.sub_record = self.node.create_subscription(String, '/medical_record', 
+            lambda m: self.event_queue.put(("record", m.data)), 10)
+        self.sub_scanner = self.node.create_subscription(String, '/scanned_qr_data', 
+            lambda m: self.event_queue.put(("scanner", m.data)), 10)
 
-        print(">>> [Patient UI] 환자용 키오스크 실행됨")
+        # UI 업데이트 루프 시작
+        self.root.after(1000, self.update_ui_loop)
+        
+        # JotForm 체크 스레드 시작
+        self.jotform_thread = threading.Thread(target=self.loop_check_jotform, daemon=True)
+        self.jotform_thread.start()
+
+        print(f">>> [UI] 키오스크 실행됨")
+
+    def update_ui_loop(self):
+        """메인 스레드에서 UI 업데이트 처리"""
+        if not self.running: return
+        try:
+            while True:
+                msg_type, data = self.event_queue.get_nowait()
+                
+                if msg_type == "jotform":
+                    self.process_new_submission(data)
+                elif msg_type == "location":
+                    name = data.strip()
+                    if name in self.dept_labels: 
+                        self.dept_labels[name].config(text="진료 중 ", fg="#4f46e5")
+                elif msg_type == "record":
+                    try:
+                        r = json.loads(data)
+                        self.medical_records.append(r)
+                        if r.get('dept') in self.dept_labels: 
+                            self.dept_labels[r.get('dept')].config(text="완료 ", fg="#10b981")
+                    except: pass
+                elif msg_type == "finish":
+                    if data: self.show_final_report()
+                elif msg_type == "scanner":
+                    self.handle_scan(data)
+        except queue.Empty:
+            pass
+        
+        self.root.after(100, self.update_ui_loop)
+
+    def loop_check_jotform(self):
+        """JotForm API 폴링 (백그라운드 스레드)"""
+        while self.running:
+            try:
+                url = f"https://api.jotform.com/form/{FORM_ID}/submissions?apiKey={API_KEY}&limit=1&orderby=created_at"
+                response = requests.get(url, timeout=5)
+                
+                if response.status_code == 200:
+                    content = response.json().get("content", [])
+                    if content:
+                        sub = content[0]
+                        sub_id = sub.get("id")
+                        if sub_id != self.last_submission_id:
+                            self.last_submission_id = sub_id
+                            self.event_queue.put(("jotform", sub))
+                            print(f"[JotForm] 데이터 수신 성공! ID: {sub_id}")
+                elif response.status_code == 429:
+                    print("[오류] 429 Too Many Requests (10초 대기)")
+                    time.sleep(10)
+            except Exception as e:
+                print(f"[통신 오류] {e}")
+            
+            time.sleep(5)
+
+    def process_new_submission(self, submission):
+        answers = submission.get("answers", {})
+        raw_name = answers.get(FIELD_ID_NAME, {}).get("answer", "방문자")
+        if isinstance(raw_name, dict): 
+            self.patient_name = f"{raw_name.get('last','')} {raw_name.get('first','')}"
+        else: 
+            self.patient_name = raw_name
+
+        self.unique_id = answers.get(FIELD_ID_UNIQUE_NUM, {}).get("answer", "000")
+        
+        # 의사용 폼 링크 생성
+        self.report_link = f"https://form.jotform.com/{DOCTOR_FORM_ID}?{TARGET_FIELD_NAME}={self.unique_id}"
+        
+        print(f"[처리 중] 환자: {self.patient_name}, ID: {self.unique_id}")
+
+        try:
+            qr = qrcode.QRCode(box_size=10, border=4)
+            qr.add_data(self.report_link)
+            qr.make(fit=True)
+            pil_image = qr.make_image(fill_color="black", back_color="white").convert('RGB')
+            pil_image = pil_image.resize((250, 250))
+            self.qr_image = ImageTk.PhotoImage(pil_image)
+        except Exception as e:
+            print(f"QR 생성 오류: {e}")
+            self.qr_image = None
+        
+        self.show_qr_simulation()
+
+    def handle_scan(self, scanned_data):
+        scanned_id = scanned_data.strip()
+        print(f"[스캔] {scanned_id}")
 
     def clear_frame(self):
-        for widget in self.main_frame.winfo_children():
+        for widget in self.main_frame.winfo_children(): 
             widget.destroy()
 
     def show_home_screen(self):
         self.clear_frame()
-        self.medical_records = []
-        
-        # 헤더
-        tk.Label(self.main_frame, text="🏥 스마트 병원", font=("Arial", 24, "bold"), bg="#f0f4f8", fg="#4f46e5").pack(pady=40)
-        tk.Label(self.main_frame, text="환자 맞춤형 대기 시스템", font=("Arial", 12), bg="#f0f4f8", fg="#666").pack(pady=(0, 20))
-        
-        # 버튼
-        tk.Button(self.main_frame, text="접수 시작", font=("Arial", 14, "bold"), bg="#4f46e5", fg="white", height=2, 
-                  command=self.show_questionnaire).pack(fill="x", pady=10)
-        
-        tk.Button(self.main_frame, text="시설 안내도", font=("Arial", 12), bg="white", command=lambda: messagebox.showinfo("안내", "화장실: 복도 끝\n비상구: 1층 정문")).pack(fill="x", pady=5)
-        
-        tk.Button(self.main_frame, text="🚨 긴급 호출", font=("Arial", 12, "bold"), bg="#ef4444", fg="white", 
-                  command=self.send_emergency).pack(side="bottom", fill="x", pady=20)
+        self.qr_image = None
+        tk.Label(self.main_frame, text="스마트 병원", font=("Arial", 24, "bold"), fg="#4f46e5").pack(pady=40)
+        tk.Label(self.main_frame, text="모바일 접수 대기 중...", font=("Arial", 16, "bold"), fg="#e11d48").pack(pady=10)
+        tk.Button(self.main_frame, text="수동 접수", font=("Arial", 14), command=self.show_questionnaire).pack(fill="x", pady=20)
+        tk.Button(self.main_frame, text="긴급 호출", font=("Arial", 14, "bold"), bg="#ef4444", fg="white",
+                  command=lambda: self.pub_emergency.publish(Bool(data=True))).pack(side="bottom", fill="x", pady=20)
 
     def show_questionnaire(self):
         self.clear_frame()
-        tk.Label(self.main_frame, text="📝 기초 문진표", font=("Arial", 18, "bold"), bg="#f0f4f8").pack(pady=20)
-        
-        tk.Label(self.main_frame, text="성함", bg="#f0f4f8", anchor="w").pack(fill="x")
+        tk.Label(self.main_frame, text="이름 입력", font=("Arial", 18)).pack(pady=20)
         self.entry_name = tk.Entry(self.main_frame, font=("Arial", 12))
         self.entry_name.pack(fill="x", pady=5)
-        
-        tk.Button(self.main_frame, text="작성 완료", bg="#4f46e5", fg="white", font=("Arial", 12, "bold"), 
-                  command=self.submit_questionnaire).pack(fill="x", pady=20)
+        tk.Button(self.main_frame, text="완료", command=lambda: [setattr(self, 'patient_name', self.entry_name.get()), setattr(self, 'unique_id', '999'), self.process_new_submission({'answers':{}})]).pack(fill="x", pady=20)
 
     def show_qr_simulation(self):
         self.clear_frame()
-        tk.Label(self.main_frame, text=f"{self.patient_name}님 접수증", font=("Arial", 18, "bold"), bg="#f0f4f8").pack(pady=20)
+        tk.Label(self.main_frame, text=f"{self.patient_name}님 접수증", font=("Arial", 18)).pack(pady=20)
         
-        qr_box = tk.Frame(self.main_frame, bg="black", width=200, height=200)
-        qr_box.pack(pady=20)
-        tk.Label(qr_box, text="QR CODE", fg="white", bg="black").place(relx=0.5, rely=0.5, anchor="center")
-        
-        tk.Label(self.main_frame, text="로봇 카메라에 QR을 보여주세요", bg="#f0f4f8").pack()
-        
-        # 시뮬레이션 버튼
-        tk.Button(self.main_frame, text="▶ 로봇 연동 시작 (터치)", bg="#10b981", fg="white", font=("Arial", 12, "bold"), 
-                  command=self.start_robot_system).pack(fill="x", pady=30)
+        if self.qr_image:
+            tk.Label(self.main_frame, image=self.qr_image).pack(pady=20)
+            tk.Label(self.main_frame, text=f"ID: {self.unique_id}", font=("Arial", 14, "bold")).pack()
+            tk.Label(self.main_frame, text="의사 선생님이 이 QR을 스캔합니다", font=("Arial", 10), fg="gray").pack()
+        else:
+            tk.Label(self.main_frame, text="[QR 생성 실패]", bg="black", fg="white", width=20, height=10).pack(pady=20)
+
+        tk.Button(self.main_frame, text="로봇 연동 시작", bg="#00CC66", fg="white", font=("Arial", 14), 
+                  command=self.start_robot_system).pack(fill="x", pady=20)
+        tk.Button(self.main_frame, text="처음으로", command=self.show_home_screen).pack(fill="x", pady=10)
 
     def show_progress_view(self):
         self.clear_frame()
-        tk.Label(self.main_frame, text="실시간 대기 현황", font=("Arial", 18, "bold"), bg="#f0f4f8").pack(pady=20)
+        tk.Label(self.main_frame, text="대기 현황", font=("Arial", 18)).pack(pady=20)
         self.dept_labels = {}
-
         for dept in DEPARTMENTS:
-            name = dept['name']
-            count = self.waiting_counts.get(name, 0)
-            
-            frame = tk.Frame(self.main_frame, bg="white", padx=10, pady=10)
+            frame = tk.Frame(self.main_frame, bg="white", padx=10, pady=5)
             frame.pack(fill="x", pady=5)
-            
-            tk.Label(frame, text=name, font=("Arial", 14, "bold"), bg="white", width=8, anchor="w").pack(side="left")
-            
-            status_text = f"대기: {count}명"
-            lbl_status = tk.Label(frame, text=status_text, font=("Arial", 12), fg="#e11d48", bg="white")
-            lbl_status.pack(side="right")
-            
-            self.dept_labels[name] = lbl_status
-
-        tk.Button(self.main_frame, text="🚨 SOS", bg="#ef4444", fg="white", command=self.send_emergency).pack(side="bottom", anchor="e", pady=20)
-
+            tk.Label(frame, text=dept['name'], width=10, anchor='w').pack(side="left")
+            count = self.waiting_counts.get(dept['name'], 0)
+            self.dept_labels[dept['name']] = tk.Label(frame, text=f"{count}명 대기", fg="red")
+            self.dept_labels[dept['name']].pack(side="right")
+    
     def show_final_report(self):
         self.clear_frame()
-        tk.Label(self.main_frame, text="📋 통합 진료 결과", font=("Arial", 20, "bold"), bg="#f0f4f8", fg="#4f46e5").pack(pady=20)
-        
-        text_area = tk.Text(self.main_frame, font=("Arial", 12), padx=10, pady=10)
-        text_area.pack(fill="both", expand=True)
-        
-        text_area.insert(tk.END, f"환자명: {self.patient_name}\n일자: {datetime.now().strftime('%Y-%m-%d')}\n\n" + "="*35 + "\n\n")
-        
-        for record in self.medical_records:
-            text_area.insert(tk.END, f"[{record['dept']}] 진료 완료\n👨‍⚕️ 소견: {record['diagnosis']}\n" + "-"*35 + "\n\n")
-        
-        text_area.config(state="disabled")
-        tk.Button(self.main_frame, text="처음으로", bg="#333", fg="white", command=self.show_home_screen).pack(fill="x", pady=10)
-
-    def submit_questionnaire(self):
-        if not self.entry_name.get(): return
-        self.patient_name = self.entry_name.get()
-        self.show_qr_simulation()
+        tk.Label(self.main_frame, text="모든 진료가 완료되었습니다!", font=("Arial", 20, "bold"), fg="blue").pack(pady=50)
+        tk.Button(self.main_frame, text="처음으로", command=self.show_home_screen).pack(pady=20)
 
     def start_robot_system(self):
-        # [핵심] 랜덤 대기 인원 생성
-        self.waiting_counts = {
-            "내과": random.randint(1, 6),
-            "외과": random.randint(1, 6),
-            "이비인후과": random.randint(1, 6),
-            "치과": random.randint(1, 6)
-        }
-        
-        data = self.waiting_counts.copy()
-        data['command'] = 'start'
-        msg = String()
-        msg.data = json.dumps(data)
-        self.pub_start.publish(msg)
-        print(f">>> [UI] 시작 신호 전송 완료 (대기인원: {self.waiting_counts})")
+        self.waiting_counts = {d['name']: random.randint(1,5) for d in DEPARTMENTS}
+        self.pub_start.publish(String(data=json.dumps({'command':'start', 'patient_name': self.patient_name, **self.waiting_counts})))
         self.show_progress_view()
 
-    def update_location_cb(self, msg):
-        hospital_name = msg.data.strip()
-        if hospital_name in self.dept_labels:
-            self.dept_labels[hospital_name].config(text="진료 중 🩺", fg="#4f46e5", font=("Arial", 12, "bold"))
-
-    def receive_record_cb(self, msg):
-        try:
-            data = json.loads(msg.data)
-            self.medical_records.append(data)
-            dept = data.get('dept')
-            if dept in self.dept_labels:
-                self.dept_labels[dept].config(text="완료 ✅", fg="#10b981")
-        except: pass
-
-    def finish_cb(self, msg):
-        if msg.data: self.show_final_report()
-
-    def send_emergency(self):
-        self.pub_emergency.publish(Bool(data=True))
-        messagebox.showwarning("긴급", "호출 신호 전송 완료!")
-
-def ros_thread(node):
-    rclpy.spin(node)
+# ==========================================
+# [수정] 안전한 ROS 스레드 처리
+# ==========================================
+def ros_thread(node, app_ref):
+    """
+    spin() 대신 spin_once()를 반복하여
+    메인 스레드가 종료 신호를 보낼 때 안전하게 루프를 빠져나오도록 함.
+    """
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+    
+    while rclpy.ok() and app_ref.running:
+        executor.spin_once(timeout_sec=0.1)
 
 def main():
+    # 환경 변수 설정
+    if "GDK_BACKEND" not in os.environ:
+        os.environ["GDK_BACKEND"] = "x11"
+
     rclpy.init()
     node = Node('patient_ui_node')
+    
     root = tk.Tk()
     app = SmartHospitalApp(root, node)
     
-    t = threading.Thread(target=ros_thread, args=(node,))
-    t.daemon = True
+    # ROS 스레드 시작 (app 객체 참조 전달)
+    t = threading.Thread(target=ros_thread, args=(node, app), daemon=True)
     t.start()
     
     try:
@@ -194,8 +264,21 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        print("[System] 종료 중...")
+        app.running = False  # 스레드 루프 정지 신호
+        t.join(timeout=1.0)  # 스레드 종료 대기
+        
+        if rclpy.ok():
+            node.destroy_node()
+            rclpy.shutdown()
+        
+        # Tkinter 종료 안전 처리
+        try:
+            if root.winfo_exists():
+                root.quit()
+                root.destroy()
+        except:
+            pass
 
 if __name__ == '__main__':
     main()
