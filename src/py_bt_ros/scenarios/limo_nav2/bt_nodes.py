@@ -1,177 +1,224 @@
 import rclpy
-import json
-import math
+import py_trees
+import py_trees_ros
 import time
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String, Bool
-from nav2_msgs.action import NavigateToPose as Nav2NavigateToPose
+from rclpy.node import Node
+from rclpy.qos import QoSProfile
+from geometry_msgs.msg import Twist, PoseStamped
+from sensor_msgs.msg import LaserScan
+from nav2_msgs.action import NavigateToPose
 from action_msgs.msg import GoalStatus
 
-import sys
-import os
-import asyncio 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
-
-from modules.base_bt_nodes import BTNodeList, Status, Node, Sequence, Fallback
-from modules.base_bt_nodes_ros import ActionWithROSAction
-
-BTNodeList.ACTION_NODES.extend([
-    'NavigateToPoseNode', 'SelectBestHospital', 'WaitForButton', 'WaitForStart', 'SetHomeTarget'
-])
-BTNodeList.CONDITION_NODES.extend(['CheckStringValue'])
-
-HOSPITAL_COORDS = {
-    "내과": {"x": 6.455, "y": 2.609},
-    "외과": {"x": 7.358, "y": 0.297},
-    "이비인후과": {"x": 5.0, "y": 1.0},
-    "치과": {"x": 2.0, "y": 2.0}
-}
-
-class WaitForStart(Node):
-    def __init__(self, tag_name, agent, name=None):
-        super().__init__(name if name else tag_name)
-        self.agent = agent
-        self.sub = agent.ros_bridge.node.create_subscription(String, '/hospital_data', self.cb, 10)
-        self.started = False
-
-    def cb(self, msg):
-        try:
-            data = json.loads(msg.data)
-            if data.get('command') == 'start':
-                self.started = True
-        except:
-            pass
-
-    async def run(self, agent, blackboard):
-        if self.started:
-            self.started = False
-            if not hasattr(agent, 'blackboard'): agent.blackboard = {}
-            agent.blackboard['visited_hospitals'] = []
-            
-            pub = agent.ros_bridge.node.create_publisher(Bool, '/exam_finished', 10)
-            pub.publish(Bool(data=False))
-            
-            agent.ros_bridge.node.get_logger().info("🔔 시작 신호 수신! 시스템 초기화 완료.")
-            return Status.SUCCESS
-        return Status.RUNNING
-
-class SelectBestHospital(Node):
-    def __init__(self, tag_name, agent, name=None):
-        super().__init__(name if name else tag_name)
-        self.agent = agent
-        self.ros_node = agent.ros_bridge.node
-        self.sub = self.ros_node.create_subscription(String, '/hospital_data', self.data_cb, 10)
-        self.latest_data = {}
-
-    def data_cb(self, msg):
-        try:
-            data = json.loads(msg.data)
-            if 'command' in data: del data['command']
-            self.latest_data = data
-        except:
-            pass
-
-    async def run(self, agent, blackboard):
-        visited = blackboard.get('visited_hospitals', [])
-        if not self.latest_data: return Status.FAILURE
-
-        candidates = {}
-        for name, count in self.latest_data.items():
-            if name not in visited:
-                candidates[name] = count
-
-        if not candidates: return Status.FAILURE
-
-        best_hospital = min(candidates, key=candidates.get)
-        wait_count = candidates[best_hospital]
-        target_xy = HOSPITAL_COORDS[best_hospital]
+# ---------------------------------------------------------
+# 1. Main Node (데이터 공유용)
+# ---------------------------------------------------------
+class BTNode(Node):
+    def __init__(self):
+        super().__init__("bt_controller_node")
         
-        blackboard['target_x'] = target_xy['x']
-        blackboard['target_y'] = target_xy['y']
-        blackboard['current_hospital_name'] = best_hospital.strip()
-
-        visited.append(best_hospital)
-        blackboard['visited_hospitals'] = visited
-
-        self.ros_node.get_logger().info(f"\n[결정] ✨ {best_hospital} 선택! (대기: {wait_count}명) -> 출발")
-        return Status.SUCCESS
-
-class SetHomeTarget(Node):
-    def __init__(self, tag_name, agent, name=None):
-        super().__init__(name if name else tag_name)
-    
-    async def run(self, agent, blackboard):
-        if not hasattr(agent, 'blackboard'): agent.blackboard = {}
-        agent.blackboard['target_x'] = 0.0
-        agent.blackboard['target_y'] = 0.0
+        # [중요] 현재 목표를 기억할 변수
+        self.current_goal_msg = None 
+        self.new_goal_received = False
         
-        # 이름 기억 삭제 (이러면 NavigateToPoseNode가 집으로 인식)
-        agent.blackboard['current_hospital_name'] = None 
-        
-        return Status.SUCCESS
+        # RViz에서 찍는 목표(/goal_pose)를 가로채서 듣기
+        self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
 
-class NavigateToPoseNode(Node): 
-    def __init__(self, tag_name, agent, name=None):
-        actual_name = name if name else tag_name
-        super().__init__(actual_name)
-        self.ros_node = agent.ros_bridge.node
-        self.timer = 0
-        
-        self.pub_hospital = self.ros_node.create_publisher(String, '/current_hospital', 10)
-        self.pub_finish = self.ros_node.create_publisher(Bool, '/exam_finished', 10)
+    def goal_callback(self, msg):
+        self.get_logger().info(f"📍 새로운 목표 수신: x={msg.pose.position.x:.2f}, y={msg.pose.position.y:.2f}")
+        self.current_goal_msg = msg
+        self.new_goal_received = True
 
-    async def run(self, agent, blackboard):
-        tx = getattr(agent, 'blackboard', {}).get('target_x', 0)
-        ty = getattr(agent, 'blackboard', {}).get('target_y', 0)
-        
-        if self.timer == 0:
-            self.ros_node.get_logger().info(f"[{self.name}] 🚀 이동 시작... ({tx}, {ty})")
-        
-        self.timer += 1
-        
-        if self.timer > 15: # 도착 시점
-            hospital_name = getattr(agent, 'blackboard', {}).get('current_hospital_name', None)
-            
-            self.ros_node.get_logger().info(f"[{self.name}] ✨ 도착 완료!")
-            
-            if hospital_name: 
-                # [상황 1] 병원 도착 -> 화면 전환 신호 (1회 전송)
-                msg = String()
-                msg.data = str(hospital_name).strip()
-                print(f" >>> [BT] 병원 도착! 화면 전환 신호 전송 ({msg.data})")
-                self.pub_hospital.publish(msg)
-
-            else:
-                # [상황 2] 집 도착 -> 최종 결과 신호 (1회 전송)
-                msg = Bool(data=True)
-                print(f"\n >>> [BT] 🏠 집 도착 완료! 최종 결과표 팝업 신호 전송! \n")
-                self.pub_finish.publish(msg)
-
-            self.timer = 0
-            return Status.SUCCESS
-            
-        return Status.RUNNING
-
-class WaitForButton(Node):
-    def __init__(self, tag_name, agent, name=None, topic_name='/doctor_confirm'):
-        actual_name = name if name else tag_name
-        super().__init__(actual_name)
+# ---------------------------------------------------------
+# 2. Condition: 장애물 감지
+# ---------------------------------------------------------
+class IsObstacleNear(py_trees.behaviour.Behaviour):
+    def __init__(self, name, topic_name="/scan", threshold=0.45):
+        super(IsObstacleNear, self).__init__(name=name)
         self.topic_name = topic_name
-        self.sub = agent.ros_bridge.node.create_subscription(Bool, topic_name, self.cb, 10)
-        self.is_pressed = False
-        self.has_reset = False
+        self.threshold = threshold
+        self.node = None
+        self.scan_data = None
 
-    def cb(self, msg):
-        if msg.data: self.is_pressed = True
+    def setup(self, **kwargs):
+        self.node = kwargs['node']
+        qos = QoSProfile(depth=10)
+        self.node.create_subscription(LaserScan, self.topic_name, self.callback, qos)
 
-    async def run(self, agent, blackboard):
-        if not self.has_reset:
-            self.is_pressed = False
-            self.has_reset = True
-            return Status.RUNNING
-        if self.is_pressed:
-            return Status.SUCCESS
-        return Status.RUNNING
+    def callback(self, msg):
+        self.scan_data = msg
 
-class CheckStringValue(Node):
-    async def run(self, a, b): return Status.FAILURE
+    def update(self):
+        if self.scan_data is None:
+            return py_trees.common.Status.FAILURE
+
+        # 전방 60도 (중앙 기준 좌우 30개 데이터)
+        num_ranges = len(self.scan_data.ranges)
+        mid_idx = num_ranges // 2
+        window = 30 
+        
+        # 유효 데이터 필터링 (0.01m ~ 100m)
+        ranges = [r for r in self.scan_data.ranges[mid_idx-window : mid_idx+window] if r > 0.01]
+        
+        if not ranges:
+            return py_trees.common.Status.FAILURE
+
+        min_dist = min(ranges)
+
+        if min_dist < self.threshold:
+            # 장애물이 있으면 SUCCESS -> 상위에서 정지 로직 발동
+            self.node.get_logger().info(f"🚨 장애물 발견! 거리: {min_dist:.2f}m")
+            return py_trees.common.Status.SUCCESS
+        else:
+            return py_trees.common.Status.FAILURE
+
+# ---------------------------------------------------------
+# 3. Action: 로봇 정지
+# ---------------------------------------------------------
+class StopRobot(py_trees.behaviour.Behaviour):
+    def __init__(self, name):
+        super(StopRobot, self).__init__(name=name)
+        self.publisher = None
+        self.node = None
+
+    def setup(self, **kwargs):
+        self.node = kwargs['node']
+        self.publisher = self.node.create_publisher(Twist, '/cmd_vel', 10)
+
+    def update(self):
+        msg = Twist()
+        # 0.0을 지속적으로 보내서 강제 정지 유지
+        self.publisher.publish(msg)
+        return py_trees.common.Status.SUCCESS
+
+# ---------------------------------------------------------
+# 4. Action: Nav2 주행 (동적 목표 처리)
+# ---------------------------------------------------------
+class Nav2DynamicGoal(py_trees.behaviour.Behaviour):
+    def __init__(self, name):
+        super(Nav2DynamicGoal, self).__init__(name=name)
+        self.node = None
+        self.action_client = None
+        self.goal_handle = None
+        self.sent_goal = False
+
+    def setup(self, **kwargs):
+        self.node = kwargs['node']
+        self.action_client = rclpy.action.ActionClient(self.node, NavigateToPose, 'navigate_to_pose')
+        
+        self.node.get_logger().info("Nav2 서버 연결 대기 중...")
+        self.action_client.wait_for_server()
+        self.node.get_logger().info("Nav2 연결 완료! RViz에서 목표를 설정하세요.")
+
+    def initialise(self):
+        # 트리가 다시 이 노드로 돌아왔을 때 (장애물 회피 후 복귀 시)
+        # 만약 이미 목표를 보내놓고 달리는 중이었다면 재전송 방지
+        pass
+
+    def update(self):
+        # 1. 목표가 아예 설정되지 않았으면 대기 (Idle)
+        if self.node.current_goal_msg is None:
+            return py_trees.common.Status.FAILURE
+
+        # 2. 새로운 목표가 들어왔거나(RViz 클릭), 장애물 때문에 멈췄다가 다시 시작해야 하는 경우
+        if self.node.new_goal_received or not self.sent_goal:
+            return self.send_new_goal()
+
+        # 3. 이미 주행 중이라면 상태 유지
+        return py_trees.common.Status.RUNNING
+
+    def send_new_goal(self):
+        # 목표 메시지 구성
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose = self.node.current_goal_msg.pose
+        goal_msg.pose.header.stamp = self.node.get_clock().now().to_msg()
+        goal_msg.pose.header.frame_id = "map" # 맵 좌표계 기준
+
+        self.node.get_logger().info(f"🚀 Nav2 목표 전송/재개")
+        
+        send_future = self.action_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(self.goal_response_callback)
+        
+        self.sent_goal = True
+        self.node.new_goal_received = False # 새 목표 처리 완료 플래그
+        return py_trees.common.Status.RUNNING
+    
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.node.get_logger().info('❌ 목표가 거부되었습니다.')
+            return
+        self.goal_handle = goal_handle
+        
+        # 결과 대기 (도착 확인용)
+        get_result_future = goal_handle.get_result_async()
+        get_result_future.add_done_callback(self.get_result_callback)
+
+    def get_result_callback(self, future):
+        status = future.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.node.get_logger().info('🎉 도착 완료!')
+            self.node.current_goal_msg = None # 목표 달성했으므로 초기화
+            self.sent_goal = False
+
+    def terminate(self, new_status):
+        # 장애물이 나타나서 이 노드가 취소될 때 (INVALID 상태로 변경됨)
+        if new_status == py_trees.common.Status.INVALID and self.goal_handle:
+            self.node.get_logger().info("⚠️ 장애물 회피를 위해 Nav2 일시 중지 (Cancel)")
+            self.goal_handle.cancel_goal_async()
+            self.sent_goal = False # 이렇게 해야 장애물이 사라지면 다시 목표를 보냄
+
+# ---------------------------------------------------------
+# 5. 트리 구성 및 실행
+# ---------------------------------------------------------
+def create_tree(ros_node):
+    # Root: Selector (우선순위 결정)
+    root = py_trees.composites.Selector(name="Hospital_Robot_Behavior", memory=False)
+
+    # 1. [긴급] 장애물 회피 시퀀스
+    # 장애물 감지 -> 정지 -> 3초 대기 (Wait Decorator 사용)
+    obstacle_seq = py_trees.composites.Sequence(name="Obstacle_Response", memory=True)
+    
+    check_obstacle = IsObstacleNear(name="Check_Obstacle", threshold=0.45)
+    stop_action = StopRobot(name="Stop_Immediately")
+    
+    # 3초 대기를 위한 Timer 데코레이터 적용
+    wait_stop = py_trees.decorators.Timeout(
+        child=stop_action,
+        duration=3.0
+    )
+    # 주의: Timeout은 시간 지나면 Failure를 낼 수 있음. 
+    # 간단히: 장애물 있으면 -> StopRobot(Success) 계속 실행됨 -> 장애물 없어지면 -> Nav2 실행
+    
+    obstacle_seq.add_children([check_obstacle, stop_action])
+
+    # 2. [기본] Nav2 주행
+    nav_behavior = Nav2DynamicGoal(name="Nav2_Dynamic_Goal")
+
+    root.add_children([obstacle_seq, nav_behavior])
+    return root
+
+def main(args=None):
+    rclpy.init(args=args)
+    
+    # 커스텀 노드 생성
+    node = BTNode()
+    root = create_tree(node)
+    
+    # 트리 셋업
+    py_trees.trees.BehaviourTree(root).setup(node=node)
+
+    try:
+        # 주기 실행 (10Hz)
+        while rclpy.ok():
+            root.tick_once()
+            rclpy.spin_once(node, timeout_sec=0.01)
+            time.sleep(0.1)
+            
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
