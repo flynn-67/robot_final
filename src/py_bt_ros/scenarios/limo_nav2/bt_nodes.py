@@ -2,8 +2,9 @@ import rclpy
 import json
 import math
 import time
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from std_msgs.msg import String, Bool
+from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import NavigateToPose as Nav2NavigateToPose
 from action_msgs.msg import GoalStatus
 
@@ -16,9 +17,19 @@ from modules.base_bt_nodes import BTNodeList, Status, Node, Sequence, Fallback
 from modules.base_bt_nodes_ros import ActionWithROSAction
 
 BTNodeList.ACTION_NODES.extend([
-    'NavigateToPoseNode', 'SelectBestHospital', 'WaitForButton', 'WaitForStart', 'SetHomeTarget'
+    'NavigateToPoseNode',
+    'SelectBestHospital',
+    'WaitForButton',
+    'WaitForStart',
+    'SetHomeTarget',
+    'StopRobot',        # ✅ 추가
 ])
-BTNodeList.CONDITION_NODES.extend(['CheckStringValue'])
+
+BTNodeList.CONDITION_NODES.extend([
+    'CheckStringValue',
+    'ObstacleNear',     # ✅ 추가
+])
+
 
 #좌표만 바꾸면 됨
 HOSPITAL_COORDS = {
@@ -27,6 +38,89 @@ HOSPITAL_COORDS = {
     "이비인후과": {"x": 5.0, "y": 1.0},
     "치과": {"x": 2.0, "y": 2.0}
 }
+# -----------------------------
+# 장애물 감지 + 정지용 노드들
+# -----------------------------
+OBSTACLE_LIMIT = 0.45   # 0.45m 이내면 앞에 장애물 있다고 판단 (원하면 조절 가능)
+
+
+class ObstacleNear(Node):
+    """
+    /scan 을 구독해서 전방에 장애물이 가까이 있으면 SUCCESS, 없으면 FAILURE 를 리턴하는 Condition 노드
+    """
+    def __init__(self, tag_name, agent, name=None):
+        super().__init__(name if name else tag_name)
+        self.agent = agent
+        self.node = agent.ros_bridge.node
+
+        # 라이다 구독
+        self.sub = self.node.create_subscription(
+            LaserScan, '/scan', self.lidar_cb, 10
+        )
+
+        self.is_danger = False
+
+    def lidar_cb(self, msg: LaserScan):
+        # 정면 기준 +/- 30개 데이터만 사용 (총 60개)
+        mid_index = len(msg.ranges) // 2
+        range_width = 30
+
+        front = msg.ranges[mid_index - range_width: mid_index + range_width]
+
+        # 0.0 이거나 inf 같은 값은 제외
+        valid = [r for r in front if r > 0.01]
+
+        if not valid:
+            self.is_danger = False
+            return
+
+        min_dist = min(valid)
+
+        if min_dist < OBSTACLE_LIMIT:
+            self.is_danger = True
+        else:
+            self.is_danger = False
+
+    async def run(self, agent, blackboard):
+        # BT에서 매 tick마다 불림
+        if self.is_danger:
+            # 장애물 가까이 있으면 Sequence 에서 SUCCESS 처리
+            return Status.SUCCESS
+        # 장애물 없으면 FAILURE → Fallback 구조에서 "다음 자식(이동)" 실행
+        return Status.FAILURE
+    
+class StopRobot(Node):
+    """
+    /cmd_vel 로 0 속도 Twist 를 계속 발행해서 로봇을 강제로 멈추는 Action 노드
+    """
+    def __init__(self, tag_name, agent, name=None):
+        super().__init__(name if name else tag_name)
+        self.agent = agent
+        self.node = agent.ros_bridge.node
+
+        self.cmd_pub = self.node.create_publisher(Twist, '/cmd_vel', 10)
+        self.last_log_time = 0.0
+
+    async def run(self, agent, blackboard):
+        # 속도 0 명령 발행
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.linear.y = 0.0
+        twist.linear.z = 0.0
+        twist.angular.x = 0.0
+        twist.angular.y = 0.0
+        twist.angular.z = 0.0
+        self.cmd_pub.publish(twist)
+
+        # 1초에 한 번만 로그 찍기 (스팸 방지)
+        now = time.time()
+        if now - self.last_log_time > 1.0:
+            self.node.get_logger().info(f"[{self.name}] 장애물 감지 → 로봇 정지 중...")
+            self.last_log_time = now
+
+        # 장애물이 있는 동안에는 계속 RUNNING 으로 유지
+        return Status.RUNNING
+
 
 class WaitForStart(Node):
     def __init__(self, tag_name, agent, name=None):

@@ -7,38 +7,96 @@
 
       <!-- 2. 병원 순회 (최적 병원 선택 -> 이동 -> 진료 대기) -->
       <!-- Visit 1 -->
+      <!-- Visit 1 -->
       <Sequence name="Visit_1">
         <SelectBestHospital name="Think_1"/>
-        <NavigateToPoseNode name="Move_1"/>
+
+        <!-- ✅ 장애물 우선 처리 Fallback -->
+        <Fallback name="SafeMove_1">
+          <!-- [1] 장애물 감지 + 정지 시퀀스 -->
+          <Sequence name="ObstacleStop_1">
+            <ObstacleNear name="CheckObstacle_1"/>
+            <StopRobot   name="HardStop_1"/>
+          </Sequence>
+
+          <!-- [2] 장애물 없을 때만 실제 이동 -->
+          <NavigateToPoseNode name="Move_1"/>
+        </Fallback>
+
         <WaitForButton name="Doctor_1"/>
       </Sequence>
+
 
       <!-- Visit 2 -->
       <Sequence name="Visit_2">
         <SelectBestHospital name="Think_2"/>
-        <NavigateToPoseNode name="Move_2"/>
+
+        <Fallback name="SafeMove_2">
+          <Sequence name="ObstacleStop_2">
+            <ObstacleNear name="CheckObstacle_2"/>
+            <StopRobot   name="HardStop_2"/>
+          </Sequence>
+          <NavigateToPoseNode name="Move_2"/>
+        </Fallback>
+
         <WaitForButton name="Doctor_2"/>
       </Sequence>
+
 
       <!-- Visit 3 -->
       <Sequence name="Visit_3">
         <SelectBestHospital name="Think_3"/>
-        <NavigateToPoseNode name="Move_3"/>
+
+        <Fallback name="SafeMove_3">
+          <Sequence name="ObstacleStop_3">
+            <ObstacleNear name="CheckObstacle_3"/>
+            <StopRobot   name="HardStop_3"/>
+          </Sequence>
+          <NavigateToPoseNode name="Move_3"/>
+        </Fallback>
+
         <WaitForButton name="Doctor_3"/>
       </Sequence>
+
 
       <!-- Visit 4 -->
       <Sequence name="Visit_4">
         <SelectBestHospital name="Think_4"/>
-        <NavigateToPoseNode name="Move_4"/>
+
+        <Fallback name="SafeMove_4">
+          <Sequence name="ObstacleStop_4">
+            <ObstacleNear name="CheckObstacle_4"/>
+            <StopRobot   name="HardStop_4"/>
+          </Sequence>
+          <NavigateToPoseNode name="Move_4"/>
+        </Fallback>
+
         <WaitForButton name="Doctor_4"/>
       </Sequence>
 
+
       <!-- 3. 모든 진료 종료 후 집으로 복귀 -->
+      <!-- Return Home -->
       <Sequence name="ReturnHome">
-         <SetHomeTarget name="SetHome"/> 
-         <NavigateToPoseNode name="MoveHome"/> 
+
+        <!-- 집 좌표 설정 -->
+        <SetHomeTarget name="SetHome"/>
+
+        <!-- 장애물 회피 + 이동 -->
+        <Fallback name="SafeMove_Home">
+
+          <!-- [1] 장애물 감지 → 정지 -->
+          <Sequence name="ObstacleStop_Home">
+            <ObstacleNear name="CheckObstacle_Home"/>
+            <StopRobot   name="HardStop_Home"/>
+          </Sequence>
+
+          <!-- [2] 장애물 없을 때만 이동 -->
+          <NavigateToPoseNode name="MoveHome"/>
+        </Fallback>
+
       </Sequence>
+
       
     </Sequence>
   </BehaviorTree>
